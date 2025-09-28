@@ -64,6 +64,14 @@ class MemoryRegion:
     executable: bool = False
 
 @dataclass
+class InstructionEvidence:
+    """指令证据记录"""
+    addr: int
+    instruction: str
+    description: str
+    raw_bytes: Optional[bytes] = None
+
+@dataclass
 class RegisterAccess:
     """寄存器访问记录"""
     base_address: int
@@ -72,16 +80,25 @@ class RegisterAccess:
     access_size: int  # 1, 2, 4, 8 bytes
     instruction_addr: int
     function_name: Optional[str] = None
+    evidence_chain: List[InstructionEvidence] = field(default_factory=list)
+    discovery_method: str = 'unknown'  # 'direct', 'hal_pattern', 'literal_pool'
+
+@dataclass
+class OffsetStats:
+    """偏移统计信息"""
+    offset: int
+    read_count: int
+    write_count: int
+    instructions: List[str]  # 相关指令记录
 
 @dataclass
 class PeripheralCandidate:
-    """外设候选信息"""
+    """外设候选信息 - 重新设计"""
     base_address: int
-    offsets: List[int]
-    access_records: List[RegisterAccess]
-    confidence: float
-    evidence_sources: List[str]
-    peripheral_type_hint: Optional[str] = None
+    size: int  # 外设大小（最大偏移+4）
+    offset_stats: Dict[int, OffsetStats]  # 偏移统计
+    refs: List[str]  # 引用函数
+    instructions: List[str]  # 所有相关指令
 
 @dataclass
 class PeripheralHint:
@@ -93,8 +110,7 @@ class PeripheralHint:
 
 class BasicParser:
     """
-    基础解析器 - 完全重新设计版本
-    
+    基础解析器
     核心功能：
     1. 解析ELF并识别MCU内存布局（Flash/RAM区域）
     2. 扫描指令识别外设基址加载模式
@@ -107,33 +123,25 @@ class BasicParser:
         self.firmware_path = Path(firmware_path)
         if not self.firmware_path.exists():
             raise FileNotFoundError(f"Firmware file not found: {firmware_path}")
-        
         if not HAS_ELFTOOLS:
             raise RuntimeError("pyelftools is required for ELF parsing")
-        
         if not HAS_CAPSTONE:
             raise RuntimeError("capstone is required for instruction analysis")
-        
         self.elf_info: Optional[ELFInfo] = None
         self.memory_regions: List[MemoryRegion] = []
         self.peripheral_candidates: List[PeripheralCandidate] = []
         self.peripheral_hints: List[PeripheralHint] = []  # 保持兼容性
-        
     def parse_elf(self) -> ELFInfo:
         """
         解析ELF文件的基础信息
-        
         目的：提取ELF文件的架构、节区、符号等基本信息
         实现：使用pyelftools解析ELF格式
         """
         logger.info(f"Parsing ELF file: {self.firmware_path}")
-        
         with open(self.firmware_path, 'rb') as f:
             elf_data = ELFFile(f)
-            
             # 解析头部信息
             header = elf_data.header
-            
             # 架构检测
             machine = header['e_machine']
             if machine == 'EM_ARM':
@@ -142,21 +150,16 @@ class BasicParser:
                 arch = 'aarch64'
             else:
                 arch = str(machine).lower()
-            
             # 字节序和字长
             endianness = 'little' if header['e_ident']['EI_DATA'] == 'ELFDATA2LSB' else 'big'
             word_size = 8 if header['e_ident']['EI_CLASS'] == 'ELFCLASS64' else 4
             entry_point = header['e_entry']
-            
             # 解析节区
             sections = self._parse_sections(elf_data)
-            
             # 解析符号表
             symbols = self._parse_symbols(elf_data)
-            
             # 构建内存布局
             memory_layout = self._build_memory_layout(elf_data)
-            
             self.elf_info = ELFInfo(
                 arch=arch,
                 endianness=endianness,
@@ -166,18 +169,14 @@ class BasicParser:
                 symbols=symbols,
                 memory_layout=memory_layout
             )
-            
             logger.info(f"ELF parsed: {arch} {endianness}-endian {word_size*8}-bit")
             return self.elf_info
-    
     def _parse_sections(self, elf_data: ELFFile) -> Dict[str, Dict[str, Any]]:
         """
         解析ELF节区
-        
         目的：提取代码段、数据段等关键节区信息
         """
         sections = {}
-        
         for section in elf_data.iter_sections():
             section_info = {
                 'name': section.name,
@@ -187,7 +186,6 @@ class BasicParser:
                 'flags': section['sh_flags'],
                 'data': None
             }
-            
             # 加载重要节区的数据
             if (section['sh_type'] != 'SHT_NOBITS' and 
                 section['sh_size'] > 0 and 
@@ -197,19 +195,14 @@ class BasicParser:
                     logger.debug(f"Loaded section {section.name}: {len(section_info['data'])} bytes")
                 except Exception as e:
                     logger.debug(f"Failed to load section {section.name}: {e}")
-            
             sections[section.name] = section_info
-            
         return sections
-    
     def _parse_symbols(self, elf_data: ELFFile) -> Dict[str, Dict[str, Any]]:
         """
         解析符号表
-        
         目的：提取函数符号、变量符号等信息
         """
         symbols = {}
-        
         for section in elf_data.iter_sections():
             if isinstance(section, SymbolTableSection):
                 for symbol in section.iter_symbols():
@@ -221,14 +214,12 @@ class BasicParser:
                             'bind': symbol['st_info']['bind'],
                             'section': symbol['st_shndx']
                         }
-        
         logger.info(f"Found {len(symbols)} symbols")
         return symbols
     
     def _build_memory_layout(self, elf_data: ELFFile) -> List[Dict[str, Any]]:
         """
         构建内存布局
-        
         目的：识别可加载段的内存映射信息
         """
         memory_layout = []
@@ -291,26 +282,15 @@ class BasicParser:
     
     def _classify_memory_region(self, vaddr: int, size: int, segment: Dict) -> str:
         """
-        根据地址和属性分类内存区域
-        
-        目的：区分Flash、RAM、外设等不同类型的内存区域
+        根据段属性分类内存区域 - 纯粹基于ELF属性，不依赖机器类型
         """
-        # ARM Cortex-M典型内存映射
-        if self.elf_info.arch == 'arm':
-            if 0x08000000 <= vaddr < 0x08200000:  # STM32 Flash
-                return 'flash'
-            elif 0x20000000 <= vaddr < 0x20080000:  # STM32 SRAM
-                return 'ram'
-            elif 0x40000000 <= vaddr < 0x60000000:  # APB/AHB peripherals
-                return 'peripheral'
-            elif 0xE0000000 <= vaddr < 0xE0100000:  # System peripherals
-                return 'peripheral'
-        
         # 基于段属性推断
         if segment['executable'] and not segment['writable']:
             return 'flash'
         elif segment['writable'] and not segment['executable']:
             return 'ram'
+        elif segment['writable'] and segment['readable']:
+            return 'data'
         
         return 'unknown'
     
@@ -327,33 +307,10 @@ class BasicParser:
     
     def _add_known_peripheral_regions(self):
         """
-        添加已知的外设区域
-        
-        目的：补充ELF中可能缺失的外设内存映射信息
+        不再添加预定义的外设区域 - 纯粹基于分析结果
         """
-        if self.elf_info.arch == 'arm':
-            # ARM Cortex-M标准外设区域
-            known_regions = [
-                (0x40000000, 0x40100000, 'APB1_peripherals'),
-                (0x40010000, 0x40020000, 'APB2_peripherals'), 
-                (0x40020000, 0x40030000, 'AHB1_peripherals'),
-                (0x50000000, 0x60000000, 'AHB2_peripherals'),
-                (0xE0000000, 0xE0100000, 'System_peripherals'),
-            ]
-            
-            for start, end, name in known_regions:
-                # 检查是否已存在
-                exists = any(r.start <= start < r.end for r in self.memory_regions)
-                if not exists:
-                    self.memory_regions.append(MemoryRegion(
-                        start=start,
-                        end=end - 1,
-                        type='peripheral',
-                        name=name,
-                        readable=True,
-                        writable=True,
-                        executable=False
-                    ))
+        # 移除机器类型相关的预定义区域
+        pass
     
     def is_address_in_firmware_memory(self, addr: int) -> bool:
         """
@@ -369,10 +326,10 @@ class BasicParser:
     
     def is_potential_mmio_address(self, addr: int) -> bool:
         """
-        检查是否是潜在的MMIO地址
+        检查是否是潜在的MMIO地址 - 纯粹基于逻辑判断
         
         目的：识别可能的外设寄存器地址
-        实现：地址在外设区域内且不在固件内存内
+        实现：不在固件内存内 + 基本合理性检查
         """
         if addr == 0 or addr < 0x1000:
             return False
@@ -381,52 +338,41 @@ class BasicParser:
         if self.is_address_in_firmware_memory(addr):
             return False
         
-        # 检查是否在已知外设区域内
-        for region in self.memory_regions:
-            if region.type == 'peripheral' and region.start <= addr <= region.end:
-                return True
+        # 地址必须4字节对齐（外设寄存器基本要求）
+        if addr % 4 != 0:
+            return False
         
-        # 通用外设地址范围检查（如果没有明确的外设区域）
-        if self.elf_info.arch == 'arm':
-            return (0x40000000 <= addr < 0x60000000 or  # APB/AHB
-                   0xE0000000 <= addr < 0xE0100000)     # System
+        # 地址应该在合理范围内（避免明显错误的地址）
+        if addr > 0xFFFFFFFF:
+            return False
         
-        return False
+        return True
     
     def extract_peripheral_candidates(self) -> List[PeripheralCandidate]:
         """
         提取外设候选列表 - 新的主要接口
-        
         目的：生成包含base_address和offsets的外设候选
         实现：按照新的设计流程进行完整分析
         """
         if not self.elf_info:
             raise ValueError("ELF not parsed yet. Call parse_elf() first.")
-        
         if not self.memory_regions:
             self.analyze_mcu_memory_layout()
-        
         logger.info("Extracting peripheral candidates using enhanced analysis")
         self.peripheral_candidates.clear()
-        
         # 步骤1: 扫描指令识别基址加载和访问模式
         register_accesses = self._scan_instructions_for_mmio_access()
-        
         # 步骤2: 聚类相同基址的访问
         clustered_candidates = self._cluster_register_accesses(register_accesses)
-        
         # 步骤3: 过滤和验证候选
         validated_candidates = self._validate_and_filter_candidates(clustered_candidates)
-        
         self.peripheral_candidates = validated_candidates
-        
         logger.info(f"Found {len(self.peripheral_candidates)} peripheral candidates")
         return self.peripheral_candidates
     
     def _scan_instructions_for_mmio_access(self) -> List[RegisterAccess]:
         """
         扫描指令识别MMIO访问模式
-        
         目的：识别所有可能的外设寄存器访问
         实现：
         1. 反汇编.text段
@@ -507,7 +453,8 @@ class BasicParser:
                     instructions, 
                     base_load['register'],
                     base_load['instruction_index'],
-                    base_load['base_address']
+                    base_load['base_address'],
+                    base_load  # 传递完整的基址加载信息
                 )
                 accesses.extend(register_accesses)
         
@@ -571,7 +518,19 @@ class BasicParser:
                             'register': dst_reg,
                             'base_address': constant_value,
                             'load_type': 'ldr_pc_relative',
-                            'instruction': f"{insn.mnemonic} {insn.op_str}"
+                            'instruction': f"{insn.mnemonic} {insn.op_str}",
+                            'evidence_chain': [
+                                {
+                                    'addr': insn.address,
+                                    'instruction': f"{insn.mnemonic} {insn.op_str}",
+                                    'description': f"LDR PC相对加载: r{dst_reg} = [PC+{pc_offset}] = [0x{actual_addr:08x}]"
+                                },
+                                {
+                                    'addr': actual_addr,
+                                    'instruction': f".word 0x{constant_value:08x}",
+                                    'description': f"字面量池值: 0x{constant_value:08x} -> r{dst_reg}"
+                                }
+                            ]
                         }
                 
                 # 立即数加载
@@ -595,11 +554,123 @@ class BasicParser:
         分析ARM64架构的地址加载指令
         
         支持的模式：
-        1. ADRP + ADD组合
-        2. MOVZ/MOVK组合
-        3. LDR literal
+        1. ADRP + ADD组合 - 页面基址 + 偏移
+        2. MOVZ/MOVK组合 - 多指令常量构造
+        3. LDR literal - PC相对字面量加载
         """
-        # ARM64实现（简化版本）
+        try:
+            mnemonic = insn.mnemonic.lower()
+            
+            # 模式1: ADRP指令（需要与ADD配对）
+            if mnemonic == 'adrp' and len(insn.operands) >= 2:
+                dst_reg = insn.operands[0].reg if insn.operands[0].type == capstone.arm64.ARM64_OP_REG else None
+                if dst_reg and insn.operands[1].type == capstone.arm64.ARM64_OP_IMM:
+                    # 查找后续的ADD指令
+                    add_result = self._find_matching_add_arm64(instructions, index + 1, dst_reg)
+                    if add_result:
+                        page_base = insn.operands[1].imm
+                        add_offset = add_result['offset']
+                        combined_addr = page_base + add_offset
+                        
+                        return {
+                            'instruction_index': index,
+                            'instruction_addr': insn.address,
+                            'register': dst_reg,
+                            'base_address': combined_addr,
+                            'load_type': 'adrp_add',
+                            'instruction': f"{insn.mnemonic} {insn.op_str}",
+                            'evidence_chain': [
+                                {
+                                    'addr': insn.address,
+                                    'instruction': f"{insn.mnemonic} {insn.op_str}",
+                                    'description': f"ADRP页面基址: 0x{page_base:016x}"
+                                },
+                                {
+                                    'addr': add_result['addr'],
+                                    'instruction': add_result['instruction'],
+                                    'description': f"ADD偏移: +0x{add_offset:x} = 0x{combined_addr:016x}"
+                                }
+                            ]
+                        }
+            
+            # 模式2: MOVZ指令（需要与MOVK配对）
+            elif mnemonic == 'movz' and len(insn.operands) >= 2:
+                dst_reg = insn.operands[0].reg if insn.operands[0].type == capstone.arm64.ARM64_OP_REG else None
+                if dst_reg and insn.operands[1].type == capstone.arm64.ARM64_OP_IMM:
+                    # 查找后续的MOVK指令序列
+                    movk_results = self._find_matching_movk_sequence_arm64(instructions, index + 1, dst_reg)
+                    if movk_results:
+                        base_value = insn.operands[1].imm
+                        combined_value = base_value
+                        evidence_chain = [{
+                            'addr': insn.address,
+                            'instruction': f"{insn.mnemonic} {insn.op_str}",
+                            'description': f"MOVZ基础值: 0x{base_value:x}"
+                        }]
+                        
+                        # 组合所有MOVK指令
+                        for movk in movk_results:
+                            shift = movk['shift']
+                            value = movk['value']
+                            combined_value |= (value << shift)
+                            evidence_chain.append({
+                                'addr': movk['addr'],
+                                'instruction': movk['instruction'],
+                                'description': f"MOVK位移{shift}: 0x{value:x} << {shift}"
+                            })
+                        
+                        evidence_chain.append({
+                            'addr': 0,
+                            'instruction': 'COMBINED',
+                            'description': f"最终地址: 0x{combined_value:016x}"
+                        })
+                        
+                        return {
+                            'instruction_index': index,
+                            'instruction_addr': insn.address,
+                            'register': dst_reg,
+                            'base_address': combined_value,
+                            'load_type': 'movz_movk',
+                            'instruction': f"{insn.mnemonic} {insn.op_str}",
+                            'evidence_chain': evidence_chain
+                        }
+            
+            # 模式3: LDR literal
+            elif mnemonic == 'ldr' and len(insn.operands) >= 2:
+                dst_reg = insn.operands[0].reg if insn.operands[0].type == capstone.arm64.ARM64_OP_REG else None
+                src_operand = insn.operands[1]
+                
+                if (dst_reg and src_operand.type == capstone.arm64.ARM64_OP_MEM and 
+                    src_operand.mem.base == capstone.arm64.ARM64_REG_INVALID):
+                    # PC相对地址
+                    target_addr = insn.address + src_operand.mem.disp
+                    constant_value = self._read_constant_from_memory_arm64(target_addr)
+                    
+                    if constant_value:
+                        return {
+                            'instruction_index': index,
+                            'instruction_addr': insn.address,
+                            'register': dst_reg,
+                            'base_address': constant_value,
+                            'load_type': 'ldr_literal_arm64',
+                            'instruction': f"{insn.mnemonic} {insn.op_str}",
+                            'evidence_chain': [
+                                {
+                                    'addr': insn.address,
+                                    'instruction': f"{insn.mnemonic} {insn.op_str}",
+                                    'description': f"LDR literal from 0x{target_addr:016x}"
+                                },
+                                {
+                                    'addr': target_addr,
+                                    'instruction': f".quad 0x{constant_value:016x}",
+                                    'description': f"字面量值: 0x{constant_value:016x}"
+                                }
+                            ]
+                        }
+        
+        except Exception as e:
+            logger.debug(f"Error analyzing ARM64 instruction {insn.address:08x}: {e}")
+        
         return None
     
     def _read_constant_from_memory(self, addr: int) -> Optional[int]:
@@ -624,7 +695,8 @@ class BasicParser:
         return None
     
     def _trace_register_dataflow_enhanced(self, instructions: List, target_reg: int, 
-                                        start_index: int, base_address: int) -> List[RegisterAccess]:
+                                          start_index: int, base_address: int, 
+                                          base_load_info: Optional[Dict] = None) -> List[RegisterAccess]:
         """
         增强的寄存器数据流追踪
         
@@ -632,6 +704,16 @@ class BasicParser:
         实现：识别[reg, #offset]访问模式，记录偏移和访问类型
         """
         accesses = []
+        
+        # 构建基址加载证据链
+        base_load_evidence = []
+        if base_load_info and 'evidence_chain' in base_load_info:
+            for evidence in base_load_info['evidence_chain']:
+                base_load_evidence.append(InstructionEvidence(
+                    addr=evidence.get('addr', 0),
+                    instruction=evidence.get('instruction', ''),
+                    description=evidence.get('description', '')
+                ))
         
         # 向后扫描指令，限制在合理范围内（避免跨函数）
         scan_range = min(len(instructions) - start_index - 1, 200)
@@ -643,13 +725,28 @@ class BasicParser:
             register_usage = self._analyze_register_usage_enhanced(insn, target_reg)
             
             if register_usage:
+                # 构建完整证据链
+                evidence_chain = []
+                
+                # 1. 添加基址加载证据
+                evidence_chain.extend(base_load_evidence)
+                
+                # 2. 添加当前访问指令
+                evidence_chain.append(InstructionEvidence(
+                    addr=insn.address,
+                    instruction=f"{insn.mnemonic} {insn.op_str}",
+                    description=f"{register_usage['access_type'].upper()} [0x{base_address:08x} + 0x{register_usage['offset']:02x}]"
+                ))
+                
                 access = RegisterAccess(
                     base_address=base_address,
                     offset=register_usage['offset'],
                     access_type=register_usage['access_type'],
                     access_size=register_usage['access_size'],
                     instruction_addr=insn.address,
-                    function_name=self._get_function_name_for_address(insn.address)
+                    function_name=self._get_function_name_for_address(insn.address),
+                    evidence_chain=evidence_chain,
+                    discovery_method='hal_pattern'
                 )
                 accesses.append(access)
             
@@ -723,13 +820,22 @@ class BasicParser:
                                     access_type = 'read' if mnemonic.startswith('ldr') else 'write'
                                     access_size = 1 if mnemonic.endswith('b') else (2 if mnemonic.endswith('h') else 4)
                                     
+                                    # 构建证据链
+                                    evidence_chain = [InstructionEvidence(
+                                        addr=insn.address,
+                                        instruction=f"{insn.mnemonic} {insn.op_str}",
+                                        description=f"直接{access_type.upper()}访问 0x{addr:08x}"
+                                    )]
+                                    
                                     access = RegisterAccess(
                                         base_address=addr,
                                         offset=0,
                                         access_type=access_type,
                                         access_size=access_size,
                                         instruction_addr=insn.address,
-                                        function_name=self._get_function_name_for_address(insn.address)
+                                        function_name=self._get_function_name_for_address(insn.address),
+                                        evidence_chain=evidence_chain,
+                                        discovery_method='direct'
                                     )
                                     accesses.append(access)
             
@@ -742,131 +848,106 @@ class BasicParser:
     def _cluster_register_accesses(self, accesses: List[RegisterAccess]) -> List[PeripheralCandidate]:
         """
         聚类寄存器访问，生成外设候选
-        
-        目的：将相同基址的访问聚合成外设候选
-        实现：按基址分组，收集偏移列表和访问记录
+        目的：将相同基址的访问聚合成外设，统计读写次数和指令
         """
         # 按基址分组
         base_groups = defaultdict(list)
         for access in accesses:
-            base_groups[access.base_address].append(access)
+            # 只处理有效的MMIO地址
+            if self.is_potential_mmio_address(access.base_address):
+                base_groups[access.base_address].append(access)
         
         candidates = []
         
         for base_addr, access_list in base_groups.items():
-            # 收集唯一偏移
-            offsets = sorted(list(set(access.offset for access in access_list)))
+            # 按偏移统计读写次数
+            offset_stats = {}
+            all_instructions = []
+            refs = set()
             
-            # 计算置信度
-            confidence = self._calculate_candidate_confidence(access_list, offsets)
+            for access in access_list:
+                offset = access.offset
+                
+                # 初始化偏移统计
+                if offset not in offset_stats:
+                    offset_stats[offset] = OffsetStats(
+                        offset=offset,
+                        read_count=0,
+                        write_count=0,
+                        instructions=[]
+                    )
+                
+                # 统计读写次数
+                if access.access_type == 'read':
+                    offset_stats[offset].read_count += 1
+                elif access.access_type == 'write':
+                    offset_stats[offset].write_count += 1
+                
+                # 收集指令信息
+                if access.evidence_chain:
+                    for evidence in access.evidence_chain:
+                        instruction_info = f"0x{evidence.addr:08x}: {evidence.instruction}"
+                        offset_stats[offset].instructions.append(instruction_info)
+                        all_instructions.append(instruction_info)
+                
+                # 收集引用函数
+                if access.function_name:
+                    refs.add(access.function_name)
             
-            # 推断外设类型
-            peripheral_type = self._infer_peripheral_type(base_addr, offsets, access_list)
-            
-            # 确定证据源
-            evidence_sources = list(set(access.function_name for access in access_list if access.function_name))
-            if not evidence_sources:
-                evidence_sources = ['instruction_analysis']
+            # 计算外设大小
+            if offset_stats:
+                max_offset = max(offset_stats.keys())
+                size = max_offset + 4  # 假设最后一个寄存器是4字节
+            else:
+                size = 4
             
             candidate = PeripheralCandidate(
                 base_address=base_addr,
-                offsets=offsets,
-                access_records=access_list,
-                confidence=confidence,
-                evidence_sources=evidence_sources,
-                peripheral_type_hint=peripheral_type
+                size=size,
+                offset_stats=offset_stats,
+                refs=list(refs),
+                instructions=list(set(all_instructions))  # 去重
             )
             
             candidates.append(candidate)
         
         return candidates
     
-    def _calculate_candidate_confidence(self, accesses: List[RegisterAccess], offsets: List[int]) -> float:
-        """
-        计算外设候选的置信度
-        
-        目的：基于访问模式评估外设候选的可信度
-        实现：考虑访问次数、偏移分布、访问类型等因素
-        """
-        base_confidence = 0.3
-        
-        # 访问次数加成
-        access_count = len(accesses)
-        if access_count >= 5:
-            base_confidence += 0.2
-        elif access_count >= 2:
-            base_confidence += 0.1
-        
-        # 偏移数量加成
-        offset_count = len(offsets)
-        if offset_count >= 4:
-            base_confidence += 0.2
-        elif offset_count >= 2:
-            base_confidence += 0.1
-        
-        # 偏移对齐检查
-        if all(offset % 4 == 0 for offset in offsets):
-            base_confidence += 0.1
-        
-        # 偏移范围检查（合理的寄存器块大小）
-        if offsets and max(offsets) - min(offsets) <= 0x100:
-            base_confidence += 0.1
-        
-        # 访问类型多样性
-        access_types = set(access.access_type for access in accesses)
-        if len(access_types) > 1:
-            base_confidence += 0.1
-        
-        return min(base_confidence, 1.0)
     
     def _validate_and_filter_candidates(self, candidates: List[PeripheralCandidate]) -> List[PeripheralCandidate]:
         """
         验证和过滤外设候选
-        
-        目的：移除低质量候选，保留高可信度的外设
-        实现：应用多种过滤规则
+        目的：基本合理性检查，不计算置信度
         """
         validated = []
         
         for candidate in candidates:
             # 基本过滤条件
-            if (candidate.confidence >= 0.4 and 
-                len(candidate.offsets) >= 1 and
-                len(candidate.access_records) >= 1):
-                
-                # 额外验证
+            if (len(candidate.offset_stats) >= 1 and 
+                candidate.base_address > 0):
+                # 基本验证
                 if self._validate_candidate_quality(candidate):
                     validated.append(candidate)
         
-        # 按置信度排序
-        validated.sort(key=lambda x: x.confidence, reverse=True)
-        
+        # 按基址排序
+        validated.sort(key=lambda x: x.base_address)
         return validated
     
     def _validate_candidate_quality(self, candidate: PeripheralCandidate) -> bool:
         """
         验证候选质量
-        
-        目的：应用启发式规则过滤误报
+        目的：基本合理性检查
         """
-        # 检查地址是否在合理范围内
+        # 检查地址是否合理
         if not self.is_potential_mmio_address(candidate.base_address):
             return False
-        
-        # 检查偏移是否合理
-        if candidate.offsets:
-            max_offset = max(candidate.offsets)
-            if max_offset > 0x1000:  # 偏移过大可能不是寄存器块
-                return False
-        
-        # 检查访问模式是否合理
-        read_count = sum(1 for acc in candidate.access_records if acc.access_type == 'read')
-        write_count = sum(1 for acc in candidate.access_records if acc.access_type == 'write')
-        
-        # 至少要有一次访问
-        if read_count + write_count == 0:
+        # 检查是否有有效的偏移统计
+        if not candidate.offset_stats:
             return False
-        
+        # 检查偏移是否合理（不超过64KB）
+        max_offset = max(candidate.offset_stats.keys())
+        if max_offset > 0x10000:
+            return False
         return True
     
     def _get_function_name_for_address(self, addr: int) -> Optional[str]:
@@ -882,10 +963,8 @@ class BasicParser:
         """检查寄存器是否被重新赋值（增强版）"""
         try:
             mnemonic = insn.mnemonic.lower()
-            
             # 赋值指令
             assignment_instructions = ['ldr', 'mov', 'add', 'sub', 'orr', 'and', 'eor', 'bic']
-            
             if mnemonic in assignment_instructions and len(insn.operands) >= 1:
                 dst_operand = insn.operands[0]
                 if (dst_operand.type == capstone.arm.ARM_OP_REG and 
@@ -896,90 +975,37 @@ class BasicParser:
         
         return False
     
-    def _infer_peripheral_type(self, base_addr: int, offsets: List[int], accesses: List[RegisterAccess]) -> Optional[str]:
-        """推断外设类型"""
-        # 基于地址范围推断
-        if 0x40013800 <= base_addr <= 0x40013C00:
-            return 'uart'
-        elif 0x40020000 <= base_addr <= 0x40023C00:
-            return 'gpio'
-        elif 0x40003000 <= base_addr <= 0x40003400:
-            return 'spi'
-        elif 0x40005400 <= base_addr <= 0x40005800:
-            return 'i2c'
-        elif 0x40010000 <= base_addr <= 0x40014000:
-            return 'timer'
-        
-        # 基于访问模式推断
-        read_count = sum(1 for acc in accesses if acc.access_type == 'read')
-        write_count = sum(1 for acc in accesses if acc.access_type == 'write')
-        
-        if read_count > write_count * 2:
-            return 'status_register'
-        elif write_count > read_count * 2:
-            return 'control_register'
-        
-        return 'unknown'
     
     def export_candidates_to_json(self, output_path: str) -> Dict:
         """
-        导出外设候选到JSON文件
-        
-        目的：生成符合要求的candidates.json文件
-        实现：转换内部数据结构为JSON格式
+        导出外设候选到JSON文件 - 按用户要求的格式
+        格式：
         """
         if not self.peripheral_candidates:
             logger.warning("No peripheral candidates to export")
             return {}
         
-        # 构建输出数据
-        export_data = {
-            'metadata': {
-                'firmware_path': str(self.firmware_path),
-                'architecture': self.elf_info.arch if self.elf_info else 'unknown',
-                'analysis_timestamp': datetime.now().isoformat(),
-                'total_candidates': len(self.peripheral_candidates),
-                'memory_regions': [
-                    {
-                        'start': hex(region.start),
-                        'end': hex(region.end),
-                        'type': region.type,
-                        'name': region.name
-                    }
-                    for region in self.memory_regions
-                ]
-            },
-            'candidates': []
-        }
+        # 构建输出数据 - 按用户要求的格式
+        export_data = {}
         
-        # 转换每个候选
         for candidate in self.peripheral_candidates:
-            candidate_data = {
-                'base_address': hex(candidate.base_address),
-                'offsets': [hex(offset) for offset in candidate.offsets],
-                'confidence': candidate.confidence,
-                'peripheral_type_hint': candidate.peripheral_type_hint,
-                'evidence_sources': candidate.evidence_sources,
-                'access_summary': {
-                    'total_accesses': len(candidate.access_records),
-                    'read_count': sum(1 for acc in candidate.access_records if acc.access_type == 'read'),
-                    'write_count': sum(1 for acc in candidate.access_records if acc.access_type == 'write'),
-                    'unique_offsets': len(candidate.offsets),
-                    'offset_range': max(candidate.offsets) - min(candidate.offsets) if candidate.offsets else 0
-                },
-                'detailed_accesses': [
-                    {
-                        'offset': hex(acc.offset),
-                        'access_type': acc.access_type,
-                        'access_size': acc.access_size,
-                        'instruction_addr': hex(acc.instruction_addr),
-                        'function_name': acc.function_name
-                    }
-                    for acc in candidate.access_records[:10]  # 限制详细记录数量
-                ]
-            }
+            base_addr_hex = f"0x{candidate.base_address:x}"
             
-            export_data['candidates'].append(candidate_data)
+            # 构建偏移列表，格式：0x00(read_count/write_count)
+            offsets = []
+            for offset, stats in candidate.offset_stats.items():
+                offset_str = f"0x{offset:02x}({stats.read_count}/{stats.write_count})"
+                offsets.append(offset_str)
+            
+            # 构建指令字符串
+            insn_str = "; ".join(candidate.instructions)
+            
+            export_data[base_addr_hex] = {
+                "size": f"0x{candidate.size:x}",
+                "offsets": offsets,
+                "refs": candidate.refs,
+                "insn": insn_str
+            }
         
         # 保存到文件
         output_file = Path(output_path)
@@ -995,7 +1021,6 @@ class BasicParser:
     def extract_peripheral_hints(self) -> List[PeripheralHint]:
         """
         提取外设提示信息 - 兼容性接口
-        
         目的：保持与现有代码的兼容性
         实现：调用新的extract_peripheral_candidates并转换格式
         """
@@ -1021,3 +1046,71 @@ class BasicParser:
         
         logger.info(f"Converted {len(candidates)} candidates to {len(self.peripheral_hints)} hints")
         return self.peripheral_hints
+    
+    # ARM64辅助方法
+    def _find_matching_add_arm64(self, instructions: List, start_index: int, target_reg: int) -> Optional[Dict]:
+        """查找匹配的ADD指令（ARM64）"""
+        for i in range(start_index, min(start_index + 5, len(instructions))):
+            insn = instructions[i]
+            if (insn.mnemonic.lower() == 'add' and 
+                len(insn.operands) >= 3 and
+                insn.operands[0].type == capstone.arm64.ARM64_OP_REG and
+                insn.operands[0].reg == target_reg and
+                insn.operands[1].type == capstone.arm64.ARM64_OP_REG and
+                insn.operands[1].reg == target_reg and
+                insn.operands[2].type == capstone.arm64.ARM64_OP_IMM):
+                return {
+                    'offset': insn.operands[2].imm,
+                    'addr': insn.address,
+                    'instruction': f"{insn.mnemonic} {insn.op_str}"
+                }
+        return None
+    
+    def _find_matching_movk_sequence_arm64(self, instructions: List, start_index: int, target_reg: int) -> List[Dict]:
+        """查找匹配的MOVK指令序列（ARM64）"""
+        movk_results = []
+        for i in range(start_index, min(start_index + 10, len(instructions))):
+            insn = instructions[i]
+            if (insn.mnemonic.lower() == 'movk' and 
+                len(insn.operands) >= 2 and
+                insn.operands[0].type == capstone.arm64.ARM64_OP_REG and
+                insn.operands[0].reg == target_reg and
+                insn.operands[1].type == capstone.arm64.ARM64_OP_IMM):
+                
+                # 获取位移值（通常在第三个操作数中）
+                shift = 0
+                if len(insn.operands) >= 3 and insn.operands[2].type == capstone.arm64.ARM64_OP_IMM:
+                    shift = insn.operands[2].imm
+                
+                movk_results.append({
+                    'value': insn.operands[1].imm,
+                    'shift': shift,
+                    'addr': insn.address,
+                    'instruction': f"{insn.mnemonic} {insn.op_str}"
+                })
+            elif insn.mnemonic.lower() in ['mov', 'ldr', 'str'] and len(insn.operands) >= 1:
+                # 如果寄存器被重新使用，停止搜索
+                if (insn.operands[0].type == capstone.arm64.ARM64_OP_REG and 
+                    insn.operands[0].reg == target_reg):
+                    break
+        
+        return movk_results
+    
+    def _read_constant_from_memory_arm64(self, addr: int) -> Optional[int]:
+        """从内存读取ARM64常量（8字节）"""
+        try:
+            text_section = self.elf_info.sections['.text']
+            text_start = text_section['addr']
+            text_end = text_start + text_section['size']
+            
+            if text_start <= addr < text_end and text_section['data']:
+                offset = addr - text_start
+                if offset + 8 <= len(text_section['data']):
+                    data = text_section['data'][offset:offset+8]
+                    if self.elf_info.endianness == 'little':
+                        return struct.unpack('<Q', data)[0]
+                    else:
+                        return struct.unpack('>Q', data)[0]
+        except:
+            pass
+        return None
