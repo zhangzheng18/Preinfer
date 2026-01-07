@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 高级行为分析器模块
