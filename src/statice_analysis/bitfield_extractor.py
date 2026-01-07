@@ -422,4 +422,3 @@ class BitfieldExtractor:
         
         return doc
 
-
