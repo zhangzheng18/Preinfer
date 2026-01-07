@@ -47,7 +47,6 @@ class AddressLoader:
         1. Thumb-2 / IT blocks 支持
         2. 复合地址计算
         3. 符号传播
-        4. ⭐ 常量池解析 (Literal Pool) - 新增
         """
         logger.info("Analyzing address loads with enhanced patterns")
         
@@ -56,12 +55,6 @@ class AddressLoader:
         # 第一遍：识别基础地址加载
         basic_loads = self._identify_basic_loads(instructions)
         address_loads.extend(basic_loads)
-        
-        # ⭐ 新增：提取常量池中的MMIO地址
-        logger.info("⭐ Extracting MMIO addresses from literal pool")
-        literal_pool_loads = self._extract_literal_pool_mmio(instructions)
-        logger.info(f"  → Found {len(literal_pool_loads)} MMIO addresses from literal pool")
-        address_loads.extend(literal_pool_loads)
         
         # 第二遍：识别复合地址计算
         compound_loads = self._identify_compound_loads(instructions, basic_loads)
@@ -75,39 +68,16 @@ class AddressLoader:
         return address_loads
     
     def _identify_basic_loads(self, instructions: List) -> List[AddressLoadInfo]:
-        """识别基础地址加载模式 - 支持ARM/MIPS/RISC-V"""
+        """识别基础地址加载模式"""
         loads = []
-        
-        # ⭐ 适配增强的架构检测 - 支持多架构
-        if not self.elf_analyzer.elf_info or not self.elf_analyzer.elf_info.arch:
-            # 默认假设ARM
-            arch_type = 'arm'
-        else:
-            arch_lower = self.elf_analyzer.elf_info.arch.lower()
-            
-            if ('arm' in arch_lower or 'stm32' in arch_lower or 'sam3' in arch_lower or
-                'max32' in arch_lower or 'cortex' in arch_lower or 'k64' in arch_lower):
-                arch_type = 'arm'
-            elif 'aarch64' in arch_lower:
-                arch_type = 'aarch64'
-            elif 'mips' in arch_lower or 'em_mips' in arch_lower:
-                arch_type = 'mips'
-            elif 'riscv' in arch_lower or 'em_riscv' in arch_lower:
-                arch_type = 'riscv'
-            else:
-                arch_type = 'arm'  # 默认
         
         for i, insn in enumerate(instructions):
             load_info = None
             
-            if arch_type == 'arm':
+            if self.elf_analyzer.elf_info.arch == 'arm':
                 load_info = self._analyze_arm_address_load_enhanced(insn, i, instructions)
-            elif arch_type == 'aarch64':
+            elif self.elf_analyzer.elf_info.arch == 'aarch64':
                 load_info = self._analyze_arm64_address_load_enhanced(insn, i, instructions)
-            elif arch_type == 'mips':
-                load_info = self._analyze_mips_address_load(insn, i, instructions)
-            elif arch_type == 'riscv':
-                load_info = self._analyze_riscv_address_load(insn, i, instructions)
             
             if load_info and self.elf_analyzer.is_potential_mmio_address(load_info.base_address):
                 loads.append(load_info)
@@ -155,25 +125,15 @@ class AddressLoader:
         return None
     
     def _analyze_ldr_instruction_enhanced(self, insn, index: int, instructions: List) -> Optional[AddressLoadInfo]:
-        """
-        增强的LDR指令分析
-        ✅ IDA Pro验证通过的PC计算方法
-        """
+        """增强的LDR指令分析"""
         dst_reg = insn.operands[0].reg if insn.operands[0].type == capstone.arm.ARM_OP_REG else None
         src_operand = insn.operands[1]
         
-        # PC相对寻址 (LDR Rx, [PC, #offset] 或 LDR Rx, =address)
+        # PC相对寻址
         if (src_operand.type == capstone.arm.ARM_OP_MEM and 
             src_operand.mem.base == capstone.arm.ARM_REG_PC):
-            offset = src_operand.mem.disp
-            
-            # ARM架构规范（IDA Pro验证通过）:
-            # Thumb-2: PC = Align(当前指令 + 4, 4)
-            # literal_addr = PC + offset
-            pc_value = insn.address + 4
-            pc_aligned = pc_value & ~0x3  # 对齐到4字节边界
-            actual_addr = pc_aligned + offset
-            
+            pc_offset = src_operand.mem.disp
+            actual_addr = insn.address + 8 + pc_offset  # ARM pipeline offset
             constant_value = self.elf_analyzer.read_constant_from_memory(actual_addr)
             
             if constant_value and dst_reg:
@@ -188,18 +148,15 @@ class AddressLoader:
                         {
                             'addr': insn.address,
                             'instruction': f"{insn.mnemonic} {insn.op_str}",
-                            'description': f"PC相对寻址加载",
-                            'literal_pool': actual_addr,
-                            'value': constant_value,
-                            'pc_calculation': {
-                                'pc_value': pc_value,
-                                'pc_aligned': pc_aligned,
-                                'offset': offset,
-                                'formula': f"({insn.address:#x} + 4) & ~0x3 + {offset:#x}"
-                            }
+                            'description': f"LDR PC相对加载: r{dst_reg} = [PC+{pc_offset}] = [0x{actual_addr:08x}]"
+                        },
+                        {
+                            'addr': actual_addr,
+                            'instruction': f".word 0x{constant_value:08x}",
+                            'description': f"字面量池值: 0x{constant_value:08x} -> r{dst_reg}"
                         }
                     ],
-                    confidence=1.0
+                    confidence=0.95
                 )
         
         # 立即数加载
@@ -262,18 +219,13 @@ class AddressLoader:
         return None
     
     def _analyze_adr_instruction(self, insn, index: int) -> Optional[AddressLoadInfo]:
-        """
-        分析ADR指令 - PC相对地址
-        ✅ IDA Pro验证通过的PC计算
-        """
+        """分析ADR指令 - PC相对地址"""
         try:
             dst_reg = insn.operands[0].reg if insn.operands[0].type == capstone.arm.ARM_OP_REG else None
             if dst_reg and insn.operands[1].type == capstone.arm.ARM_OP_IMM:
-                # ARM架构规范（与LDR一致）:
-                # PC = Align(当前指令 + 4, 4)
-                pc_value = insn.address + 4
-                pc_aligned = pc_value & ~0x3
-                target_addr = pc_aligned + insn.operands[1].imm
+                # ADR计算：PC + offset
+                pc_value = insn.address + 8  # ARM pipeline
+                target_addr = pc_value + insn.operands[1].imm
                 
                 return AddressLoadInfo(
                     instruction_index=index,
@@ -285,25 +237,17 @@ class AddressLoader:
                     evidence_chain=[{
                         'addr': insn.address,
                         'instruction': f"{insn.mnemonic} {insn.op_str}",
-                        'description': f"ADR PC相对: r{dst_reg} = PC_aligned + {insn.operands[1].imm} = 0x{target_addr:08x}",
-                        'pc_calculation': {
-                            'pc_value': pc_value,
-                            'pc_aligned': pc_aligned,
-                            'offset': insn.operands[1].imm,
-                            'target': target_addr
-                        }
+                        'description': f"ADR PC相对: r{dst_reg} = PC + {insn.operands[1].imm} = 0x{target_addr:08x}"
                     }],
-                    confidence=0.9
+                    confidence=0.85
                 )
         except:
             pass
         return None
     
     def _analyze_thumb2_ldr(self, insn, index: int, instructions: List) -> Optional[AddressLoadInfo]:
-        """
-        分析Thumb-2 LDR.W指令
-        ✅ 使用与标准LDR相同的IDA Pro验证通过的PC计算
-        """
+        """分析Thumb-2 LDR.W指令"""
+        # Thumb-2的LDR.W通常有更复杂的寻址模式
         try:
             dst_reg = insn.operands[0].reg if insn.operands[0].type == capstone.arm.ARM_OP_REG else None
             src_operand = insn.operands[1]
@@ -311,13 +255,10 @@ class AddressLoader:
             if dst_reg and src_operand.type == capstone.arm.ARM_OP_MEM:
                 # 检查是否是PC相对寻址
                 if src_operand.mem.base == capstone.arm.ARM_REG_PC:
-                    offset = src_operand.mem.disp
-                    
-                    # 使用与标准LDR相同的计算方法
-                    pc_value = insn.address + 4
-                    pc_aligned = pc_value & ~0x3
-                    actual_addr = pc_aligned + offset
-                    
+                    pc_offset = src_operand.mem.disp
+                    # Thumb模式下PC对齐到4字节
+                    pc_value = (insn.address + 4) & ~3
+                    actual_addr = pc_value + pc_offset
                     constant_value = self.elf_analyzer.read_constant_from_memory(actual_addr)
                     
                     if constant_value:
@@ -331,16 +272,9 @@ class AddressLoader:
                             evidence_chain=[{
                                 'addr': insn.address,
                                 'instruction': f"{insn.mnemonic} {insn.op_str}",
-                                'description': f"Thumb-2 LDR.W PC相对",
-                                'literal_pool': actual_addr,
-                                'value': constant_value,
-                                'pc_calculation': {
-                                    'pc_value': pc_value,
-                                    'pc_aligned': pc_aligned,
-                                    'offset': offset
-                                }
+                                'description': f"Thumb-2 LDR: r{dst_reg} = [0x{actual_addr:08x}] = 0x{constant_value:08x}"
                             }],
-                            confidence=1.0
+                            confidence=0.9
                         )
         except:
             pass
@@ -791,359 +725,5 @@ class AddressLoader:
                     ],
                     confidence=0.9
                 )
-        
-        return None
-    
-    def _extract_literal_pool_mmio(self, instructions: List) -> List[AddressLoadInfo]:
-        """
-        ⭐ 新增：从常量池(Literal Pool)中提取MMIO地址
-        
-        解决问题：
-        - IDA Pro显示: LDR R3, =0x40021000
-        - 实际编译为: LDR R3, [PC, #offset]
-        - 真实值在常量池: .word 0x40021000
-        
-        ARM Thumb-2模式下，PC相对寻址的计算方式：
-        - target_addr = (PC + 4) + offset
-        - PC指向当前指令+4（已对齐到4字节）
-        """
-        import struct
-        
-        literal_pool_loads = []
-        seen_addresses = set()  # 去重
-        
-        for i, insn in enumerate(instructions):
-            try:
-                # 只处理LDR指令
-                if insn.mnemonic.lower() not in ['ldr', 'ldr.w']:
-                    continue
-                
-                if len(insn.operands) < 2:
-                    continue
-                
-                dst_reg = insn.operands[0].reg if insn.operands[0].type == capstone.arm.ARM_OP_REG else None
-                src_operand = insn.operands[1]
-                
-                # 检查是否是PC相对寻址
-                if (src_operand.type == capstone.arm.ARM_OP_MEM and 
-                    src_operand.mem.base == capstone.arm.ARM_REG_PC):
-                    
-                    offset = src_operand.mem.disp
-                    
-                    # ⭐ ARM Thumb-2 PC计算：(PC+4) + offset
-                    # 注意：Capstone返回的address已经是对齐的
-                    current_pc = insn.address
-                    
-                    # Thumb模式：PC+4，然后对齐到4字节
-                    aligned_pc = (current_pc + 4) & ~0x3
-                    pool_addr = aligned_pc + offset
-                    
-                    # 从ELF读取常量池的值
-                    constant_value = self._read_word_from_elf(pool_addr)
-                    
-                    if constant_value is None:
-                        continue
-                    
-                    # ⭐ 判断是否是MMIO地址
-                    if not self._is_mmio_address(constant_value):
-                        continue
-                    
-                    # 去重
-                    if constant_value in seen_addresses:
-                        continue
-                    seen_addresses.add(constant_value)
-                    
-                    # 记录到常量池字典
-                    self.constant_pool[insn.address] = {
-                        'value': constant_value,
-                        'pool_addr': pool_addr,
-                        'target_reg': dst_reg
-                    }
-                    
-                    # 创建AddressLoadInfo
-                    load_info = AddressLoadInfo(
-                        instruction_index=i,
-                        instruction_addr=insn.address,
-                        register=dst_reg,
-                        base_address=constant_value,
-                        load_type='ldr_literal_pool',
-                        instruction=f"{insn.mnemonic} {insn.op_str}",
-                        evidence_chain=[
-                            {
-                                'addr': insn.address,
-                                'instruction': f"{insn.mnemonic} {insn.op_str}",
-                                'description': f"LDR from literal pool @ 0x{pool_addr:08x}"
-                            },
-                            {
-                                'addr': pool_addr,
-                                'instruction': f".word 0x{constant_value:08x}",
-                                'description': f"Literal pool value: 0x{constant_value:08x}"
-                            }
-                        ],
-                        confidence=0.95
-                    )
-                    
-                    literal_pool_loads.append(load_info)
-                    logger.debug(f"  Literal pool @ {insn.address:#08x}: {constant_value:#010x}")
-                    
-            except Exception as e:
-                logger.debug(f"Error extracting literal pool at {insn.address:#x}: {e}")
-                continue
-        
-        return literal_pool_loads
-    
-    def _read_word_from_elf(self, addr: int) -> Optional[int]:
-        """
-        从ELF文件中读取指定地址的4字节word
-        
-        搜索顺序: text → rodata → data
-        """
-        import struct
-        
-        # ⭐ 修正：直接访问elf_info.sections
-        for section_name in ['text', '.text', 'rodata', '.rodata', 'data', '.data', '.data.rel.ro']:
-            try:
-                if section_name not in self.elf_analyzer.elf_info.sections:
-                    continue
-                
-                section_info = self.elf_analyzer.elf_info.sections[section_name]
-                section_addr = section_info['addr']
-                section_data = section_info['data']
-                
-                if not section_data:
-                    continue
-                
-                section_size = len(section_data)
-                
-                # 检查地址是否在这个段中
-                if section_addr <= addr < section_addr + section_size:
-                    offset = addr - section_addr
-                    
-                    # 确保不会越界
-                    if offset + 4 <= section_size:
-                        word = struct.unpack('<I', section_data[offset:offset+4])[0]
-                        return word
-                        
-            except Exception as e:
-                logger.debug(f"Error reading from section {section_name}: {e}")
-                continue
-        
-        return None
-    
-    def _is_mmio_address(self, addr: int) -> bool:
-        """
-        判断地址是否是MMIO地址
-        
-        ARM Cortex-M内存映射:
-        - 0x40000000-0x5FFFFFFF: 外设区
-        - 0xE0000000-0xE00FFFFF: 系统外设 (NVIC, SCB, SysTick等)
-        
-        MIPS内存映射:
-        - 0xA0000000-0xBFFFFFFF: KSEG1 (uncached, unmapped) - 常用于外设MMIO
-        - 0x1F800000-0x1FFFFFFF: 物理外设区 (PIC32等)
-        
-        RISC-V内存映射:
-        - 0x10000000-0x1FFFFFFF: 外设区 (典型)
-        - 0x40000000-0x5FFFFFFF: 外设区 (部分MCU)
-        """
-        # ARM外设区域 (标准)
-        if 0x40000000 <= addr < 0x60000000:
-            return True
-        
-        # ARM系统外设区域 (Cortex-M)
-        if 0xE0000000 <= addr < 0xE0100000:
-            return True
-        
-        # NXP Kinetis特殊区域
-        if 0x50000000 <= addr < 0x54000000:
-            return True
-        
-        # ⭐ MIPS KSEG1 uncached区域 (常用于MMIO)
-        if 0xA0000000 <= addr <= 0xBFFFFFFF:
-            return True
-        
-        # ⭐ MIPS物理外设区 (PIC32等)
-        if 0x1F800000 <= addr <= 0x1FFFFFFF:
-            return True
-        
-        # ⭐ RISC-V典型外设区
-        if 0x10000000 <= addr < 0x20000000:
-            return True
-        
-        return False
-    
-    # ==================== MIPS地址加载分析 ====================
-    
-    def _analyze_mips_address_load(self, insn, index: int, instructions: List) -> Optional[AddressLoadInfo]:
-        """
-        MIPS地址加载分析
-        
-        常见模式:
-        1. lui $t0, upper16   # 加载高16位
-           ori $t0, $t0, lower16  # 或运算低16位
-        2. lw $t0, offset($gp) # 从全局指针加载
-        3. la $t0, addr        # 伪指令，由汇编器展开
-        """
-        try:
-            mnemonic = insn.mnemonic.lower()
-            
-            # 模式1: LUI+ORI组合
-            if mnemonic == 'lui' and len(insn.operands) >= 2:
-                # 获取高16位
-                try:
-                    upper16 = insn.operands[1].imm
-                    dest_reg = insn.operands[0].reg
-                    
-                    # 查找后续的ORI指令
-                    for j in range(index + 1, min(index + 5, len(instructions))):
-                        next_insn = instructions[j]
-                        if (next_insn.mnemonic.lower() == 'ori' and 
-                            len(next_insn.operands) >= 3 and
-                            next_insn.operands[1].reg == dest_reg):
-                            
-                            lower16 = next_insn.operands[2].imm
-                            address = (upper16 << 16) | lower16
-                            
-                            if self._is_mmio_address(address):
-                                return AddressLoadInfo(
-                                    instruction_index=j,  # ⭐ 使用ORI指令的索引
-                                    instruction_addr=next_insn.address,  # ⭐ 使用ORI指令的地址（最终定义点）
-                                    register=dest_reg,
-                                    base_address=address,
-                                    load_type='lui_ori',
-                                    instruction=f"{insn.mnemonic} {insn.op_str}",
-                                    evidence_chain=[
-                                        {'addr': insn.address, 'instruction': f"{insn.mnemonic} {insn.op_str}"},
-                                        {'addr': next_insn.address, 'instruction': f"{next_insn.mnemonic} {next_insn.op_str}"}
-                                    ],
-                                    confidence=0.95
-                                )
-                except Exception as e:
-                    logger.debug(f"Error parsing MIPS LUI at {insn.address:#x}: {e}")
-            
-            # 模式2: LW/SW with immediate
-            elif mnemonic in ['lw', 'sw', 'lb', 'sb', 'lh', 'sh'] and len(insn.operands) >= 2:
-                try:
-                    # MIPS格式: lw $t0, offset($base)
-                    if insn.operands[1].type == capstone.mips.MIPS_OP_MEM:
-                        mem = insn.operands[1].mem
-                        # 如果是绝对地址（base=0）
-                        if mem.base == 0 and mem.disp != 0:
-                            address = mem.disp & 0xFFFFFFFF
-                            if self._is_mmio_address(address):
-                                return AddressLoadInfo(
-                                    instruction_index=index,
-                                    instruction_addr=insn.address,
-                                    register=insn.operands[0].reg,
-                                    base_address=address,
-                                    load_type='mips_mem',
-                                    instruction=f"{insn.mnemonic} {insn.op_str}",
-                                    confidence=0.9
-                                )
-                except Exception as e:
-                    logger.debug(f"Error parsing MIPS MEM at {insn.address:#x}: {e}")
-        
-        except Exception as e:
-            logger.debug(f"Error analyzing MIPS instruction {insn.address:#x}: {e}")
-        
-        return None
-    
-    # ==================== RISC-V地址加载分析 ====================
-    
-    def _analyze_riscv_address_load(self, insn, index: int, instructions: List) -> Optional[AddressLoadInfo]:
-        """
-        RISC-V地址加载分析
-        
-        常见模式:
-        1. lui rd, upper20    # 加载高20位
-           addi rd, rd, lower12  # 加偏移低12位
-        2. la rd, symbol      # 伪指令（由lui+addi展开）
-        3. lw/sw rd, offset(rs) # 内存访问
-        """
-        try:
-            mnemonic = insn.mnemonic.lower()
-            
-            # 模式1: LUI+ADDI组合
-            if mnemonic == 'lui' and len(insn.operands) >= 2:
-                try:
-                    upper20 = insn.operands[1].imm
-                    dest_reg = insn.operands[0].reg
-                    
-                    # 查找后续的ADDI指令
-                    for j in range(index + 1, min(index + 5, len(instructions))):
-                        next_insn = instructions[j]
-                        if (next_insn.mnemonic.lower() in ['addi', 'add'] and 
-                            len(next_insn.operands) >= 3):
-                            
-                            # 检查是否操作同一个寄存器
-                            if next_insn.operands[1].reg == dest_reg:
-                                # RISC-V: addi rd, rs, imm
-                                if next_insn.operands[2].type == capstone.riscv.RISCV_OP_IMM:
-                                    lower12 = next_insn.operands[2].imm
-                                    # 处理符号扩展
-                                    if lower12 & 0x800:  # 负数
-                                        lower12 = lower12 - 0x1000
-                                    
-                                    address = (upper20 << 12) + lower12
-                                    address = address & 0xFFFFFFFF  # 32位
-                                    
-                                    if self._is_mmio_address(address):
-                                        return AddressLoadInfo(
-                                            instruction_index=j,  # ⭐ 使用ADDI指令的索引
-                                            instruction_addr=next_insn.address,  # ⭐ 使用ADDI指令的地址（最终定义点）
-                                            register=dest_reg,
-                                            base_address=address,
-                                            load_type='lui_addi',
-                                            instruction=f"{insn.mnemonic} {insn.op_str}",
-                                            evidence_chain=[
-                                                {'addr': insn.address, 'instruction': f"{insn.mnemonic} {insn.op_str}"},
-                                                {'addr': next_insn.address, 'instruction': f"{next_insn.mnemonic} {next_insn.op_str}"}
-                                            ],
-                                            confidence=0.95
-                                        )
-                except Exception as e:
-                    logger.debug(f"Error parsing RISC-V LUI at {insn.address:#x}: {e}")
-            
-            # 模式2: LI伪指令 (已展开为实际指令)
-            elif mnemonic == 'li' and len(insn.operands) >= 2:
-                try:
-                    if insn.operands[1].type == capstone.riscv.RISCV_OP_IMM:
-                        address = insn.operands[1].imm & 0xFFFFFFFF
-                        if self._is_mmio_address(address):
-                            return AddressLoadInfo(
-                                instruction_index=index,
-                                instruction_addr=insn.address,
-                                register=insn.operands[0].reg,
-                                base_address=address,
-                                load_type='riscv_li',
-                                instruction=f"{insn.mnemonic} {insn.op_str}",
-                                confidence=0.9
-                            )
-                except Exception as e:
-                    logger.debug(f"Error parsing RISC-V LI at {insn.address:#x}: {e}")
-            
-            # 模式3: LW/SW with absolute address
-            elif mnemonic in ['lw', 'sw', 'lb', 'sb', 'lh', 'sh', 'ld', 'sd'] and len(insn.operands) >= 2:
-                try:
-                    if insn.operands[1].type == capstone.riscv.RISCV_OP_MEM:
-                        mem = insn.operands[1].mem
-                        # 如果是绝对地址（base=0）
-                        if mem.base == 0 and mem.disp != 0:
-                            address = mem.disp & 0xFFFFFFFF
-                            if self._is_mmio_address(address):
-                                return AddressLoadInfo(
-                                    instruction_index=index,
-                                    instruction_addr=insn.address,
-                                    register=insn.operands[0].reg,
-                                    base_address=address,
-                                    load_type='riscv_mem',
-                                    instruction=f"{insn.mnemonic} {insn.op_str}",
-                                    confidence=0.9
-                                )
-                except Exception as e:
-                    logger.debug(f"Error parsing RISC-V MEM at {insn.address:#x}: {e}")
-        
-        except Exception as e:
-            logger.debug(f"Error analyzing RISC-V instruction {insn.address:#x}: {e}")
         
         return None
