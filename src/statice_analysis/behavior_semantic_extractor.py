@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 行为语义提取器模块
